@@ -8,6 +8,8 @@
  * - Accurate Business Operating Day mapping.
  */
 
+import { ContractWeek } from '../types';
+
 export const DAY_NAMES_SUN_FIRST = [
   'Sunday',
   'Monday',
@@ -276,4 +278,63 @@ export function isDateHoliday(
   );
 
   return normalizedHolidays.has(isoDate) || holidayDates.includes(dateStr);
+}
+
+/**
+ * Groups a set of dates into true calendar contract weeks.
+ * Supports configurable week start day (0 = Sunday, 1 = Monday, 6 = Saturday). Default: 1 (Monday).
+ * Never uses array modulo or positional indexing.
+ */
+export function buildContractWeeks(
+  dates: string[],
+  weekStartsOn: number = 1, // 0 = Sun, 1 = Mon, 6 = Sat
+  dateFormatHint: 'DMY' | 'MDY' | 'auto' = 'auto'
+): ContractWeek[] {
+  if (!dates || dates.length === 0) return [];
+
+  // Sort unique dates chronologically
+  const uniqueDates = Array.from(new Set(dates));
+  const sortedDates = sortDatesChronologically(uniqueDates, dateFormatHint);
+
+  // Group dates by week start epoch
+  const weekMap = new Map<number, { startDate: string; dates: string[] }>();
+
+  for (const dateStr of sortedDates) {
+    const comp = parseDateComponents(dateStr, dateFormatHint);
+    // JS getUTCDay(): 0 = Sun, 1 = Mon, ..., 6 = Sat
+    const dayOfWeek = comp.dayOfWeek;
+    const offsetFromWeekStart = (dayOfWeek - weekStartsOn + 7) % 7;
+    const weekStartEpoch = comp.epochSeconds - offsetFromWeekStart * 86400;
+
+    let weekEntry = weekMap.get(weekStartEpoch);
+    if (!weekEntry) {
+      const wStartDate = new Date(weekStartEpoch * 1000).toISOString().split('T')[0];
+      weekEntry = { startDate: wStartDate, dates: [] };
+      weekMap.set(weekStartEpoch, weekEntry);
+    }
+    weekEntry.dates.push(dateStr);
+  }
+
+  // Sort week groups chronologically
+  const sortedEpochs = Array.from(weekMap.keys()).sort((a, b) => a - b);
+  const result: ContractWeek[] = [];
+
+  for (let idx = 0; idx < sortedEpochs.length; idx++) {
+    const epoch = sortedEpochs[idx];
+    const group = weekMap.get(epoch)!;
+    const isFullWeek = group.dates.length === 7;
+    const weekEndEpoch = epoch + 6 * 86400;
+    const endDate = new Date(weekEndEpoch * 1000).toISOString().split('T')[0];
+
+    result.push({
+      weekIndex: idx,
+      startDate: group.startDate,
+      endDate,
+      dates: group.dates,
+      isFullWeek,
+      type: isFullWeek ? 'FULL_WEEK' : 'PARTIAL_WEEK',
+    });
+  }
+
+  return result;
 }

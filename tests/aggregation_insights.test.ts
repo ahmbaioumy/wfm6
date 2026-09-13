@@ -135,7 +135,7 @@ describe('Aggregations, Insights & Reverse Mode Solver (Tests 32-37)', () => {
 
   // Test 36: Reverse Mode Headcount Solver finds HC required to meet SLA target
   it('Test 36: Reverse Mode Solver calculates additional headcount needed to reach target SLA', () => {
-    const lowConfig = { ...baseConfig, totalHC: 50, slaPercentTarget: 90 };
+    const lowConfig = { ...baseConfig, totalHC: 30, slaPercentTarget: 90 };
     const roster = generateRoster(lowConfig, intervals, erlangReqs, demands);
     const { baseResult } = runMonteCarloSimulation(demands, roster.intervalStaffing, lowConfig, roster.agents, roster.events);
 

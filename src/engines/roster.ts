@@ -19,6 +19,7 @@ import {
   FeasibilityIssue,
   DemandRow,
   RosterValidationResult,
+  ContractWeek,
 } from '../types';
 import { parseDateTimeToEpochSeconds } from '../data/sampleDemand';
 import { PRNG } from './des';
@@ -30,7 +31,17 @@ import {
   timeStringToMinutes,
   minutesToTimeString,
   sortDatesChronologically,
+  buildContractWeeks,
 } from './dateUtils';
+
+export interface PhysicalResourceRequirement {
+  resourceId: string;
+  isShared: boolean;
+  poolId?: string;
+  segments: string[];
+  requiredCurve: Map<string, number>;
+  dailyPressureMap: Map<string, number>;
+}
 
 export interface GeneratedRoster {
   agents: SyntheticAgent[];
@@ -73,6 +84,7 @@ export function formatTime(m: number): string {
 /**
  * Function 3: buildRequiredCoverageCurve
  * Builds Date × Interval requirement curve and daily pressure map from demands and Erlang solver.
+ * Supports both global requirement curves and resource-specific curves (Dedicated vs Shared Pools).
  */
 export function buildRequiredCoverageCurve(
   demands: DemandRow[],
@@ -81,12 +93,68 @@ export function buildRequiredCoverageCurve(
   requiredCurve: Map<string, number>;
   dailyPressureMap: Map<string, number>;
   intervalDetailsMap: Map<string, { volume: number; aht: number; trafficErlangs: number; requiredHC: number }>;
+  resourceRequirements: Map<string, PhysicalResourceRequirement>;
 } {
   const requiredCurve = new Map<string, number>();
   const dailyPressureMap = new Map<string, number>();
   const intervalDetailsMap = new Map<string, { volume: number; aht: number; trafficErlangs: number; requiredHC: number }>();
+  const resourceRequirements = new Map<string, PhysicalResourceRequirement>();
+
+  const getOrCreateResourceReq = (resourceId: string, isShared: boolean, poolId?: string, segment?: string): PhysicalResourceRequirement => {
+    let res = resourceRequirements.get(resourceId);
+    if (!res) {
+      res = {
+        resourceId,
+        isShared,
+        poolId,
+        segments: segment ? [segment] : [],
+        requiredCurve: new Map<string, number>(),
+        dailyPressureMap: new Map<string, number>(),
+      };
+      resourceRequirements.set(resourceId, res);
+    } else if (segment && !res.segments.includes(segment)) {
+      res.segments.push(segment);
+    }
+    return res;
+  };
+
+  // Group demands by (resourceId, date, intervalStart) to solve pooled requirements accurately
+  const resourceIntervalDemand = new Map<string, {
+    resourceId: string;
+    isShared: boolean;
+    poolId?: string;
+    segment: string;
+    date: string;
+    intervalStart: string;
+    volume: number;
+    workloadSeconds: number;
+    ahtSeconds: number;
+    intervalMinutes: number;
+  }[]>();
 
   for (const d of demands) {
+    const isShared = config.segmentConfigs?.[d.segment]?.allocationType === 'shared';
+    const poolId = config.segmentConfigs?.[d.segment]?.poolId || (isShared ? 'shared_pool' : undefined);
+    const resourceId = isShared && poolId ? `POOL:${poolId}` : `SEGMENT:${d.segment}`;
+
+    getOrCreateResourceReq(resourceId, isShared, poolId, d.segment);
+
+    const groupKey = `${resourceId}__${d.date}__${d.intervalStart}`;
+    const list = resourceIntervalDemand.get(groupKey) || [];
+    list.push({
+      resourceId,
+      isShared,
+      poolId,
+      segment: d.segment,
+      date: d.date,
+      intervalStart: d.intervalStart,
+      volume: d.volume,
+      workloadSeconds: d.workloadSeconds || (d.volume * d.ahtSeconds),
+      ahtSeconds: d.ahtSeconds,
+      intervalMinutes: d.intervalMinutes || 30,
+    });
+    resourceIntervalDemand.set(groupKey, list);
+
     const key = `${d.date}__${d.intervalStart}`;
     const requiredHC = solveRequiredStaffing(
       d.trafficErlangs,
@@ -114,7 +182,36 @@ export function buildRequiredCoverageCurve(
     });
   }
 
-  return { requiredCurve, dailyPressureMap, intervalDetailsMap };
+  // Calculate requirement curve per physical resource pool
+  for (const [, items] of resourceIntervalDemand.entries()) {
+    const first = items[0];
+    const totalVolume = items.reduce((s, it) => s + it.volume, 0);
+    const totalWorkload = items.reduce((s, it) => s + it.workloadSeconds, 0);
+    const pooledAht = totalVolume > 0 ? totalWorkload / totalVolume : first.ahtSeconds;
+    const intervalSec = (first.intervalMinutes || 30) * 60;
+    const pooledTraffic = intervalSec > 0 ? totalWorkload / intervalSec : 0;
+
+    const resReqHC = solveRequiredStaffing(
+      pooledTraffic,
+      pooledAht,
+      config.slaPercentTarget / 100,
+      config.slaThresholdSeconds,
+      config.maxOccupancyThreshold / 100,
+      config.minCoverage,
+      config.erlangModel,
+      config.defaultPatienceSeconds
+    );
+
+    const resObj = resourceRequirements.get(first.resourceId);
+    if (resObj) {
+      const timeKey = `${first.date}__${first.intervalStart}`;
+      resObj.requiredCurve.set(timeKey, resReqHC);
+      const curP = resObj.dailyPressureMap.get(first.date) || 0;
+      resObj.dailyPressureMap.set(first.date, curP + resReqHC);
+    }
+  }
+
+  return { requiredCurve, dailyPressureMap, intervalDetailsMap, resourceRequirements };
 }
 
 /**
@@ -141,11 +238,9 @@ export function generateCandidateShifts(
   const bStart = timeToMinutes(config.businessHoursStart || '08:00');
   const bEnd = timeToMinutes(config.businessHoursEnd || '20:00');
 
-  let windowStart = Math.min(bStart, operatingWindow.startMin);
-  let windowEnd = Math.max(bEnd, operatingWindow.endMin);
-
-  let earliestStart = windowStart;
-  let latestStart = Math.max(earliestStart, windowEnd - shiftDurationMins);
+  // Authoritative business hours from configuration (Part 9)
+  let earliestStart = bStart;
+  let latestStart = Math.max(earliestStart, bEnd - shiftDurationMins);
 
   if (isFemale && config.femaleConstraintStrict) {
     const femaleEarliest = timeToMinutes(config.femaleEarliestStart || '06:00');
@@ -246,7 +341,8 @@ export function assignCoverageOptimizedShifts(
   operatingWindow: { startMin: number; endMin: number },
   intervalMins: number = 30,
   dIdx: number = 0,
-  uniqueDates: string[] = []
+  uniqueDates: string[] = [],
+  resourceRequirements?: Map<string, PhysicalResourceRequirement>
 ) {
   const paidShiftHours = config.dailyPaidHours ?? 8;
   const paidShiftMins = Math.round(paidShiftHours * 60);
@@ -278,6 +374,9 @@ export function assignCoverageOptimizedShifts(
       const isFemale = member.gender === 'F';
       const candidates = generateCandidateShifts(config, operatingWindow, paidShiftMins, shiftStep, isFemale);
 
+      const resKey = member.poolId ? `POOL:${member.poolId}` : `SEGMENT:${member.segment}`;
+      const memberReqCurve = (resourceRequirements && resourceRequirements.get(resKey)?.requiredCurve) || requiredCurve;
+
       let bestStart = candidates[0] || timeToMinutes(config.businessHoursStart || '08:00');
       let bestScore = -Infinity;
 
@@ -286,7 +385,7 @@ export function assignCoverageOptimizedShifts(
           cand,
           paidShiftMins,
           date,
-          requiredCurve,
+          memberReqCurve,
           currentScheduledCurve,
           config,
           intervalMins
@@ -367,6 +466,8 @@ export function assignCoverageOptimizedShifts(
     if (supervisor) {
       const isFemale = supervisor.gender === 'F';
       const candidates = generateCandidateShifts(config, operatingWindow, paidShiftMins, shiftStep, isFemale);
+      const supResKey = supervisor.poolId ? `POOL:${supervisor.poolId}` : `SEGMENT:${supervisor.segment}`;
+      const supReqCurve = (resourceRequirements && resourceRequirements.get(supResKey)?.requiredCurve) || requiredCurve;
 
       let majorityStart = candidates[0] || timeToMinutes(config.businessHoursStart || '08:00');
       if (memberStartTimes.length > 0) {
@@ -390,7 +491,7 @@ export function assignCoverageOptimizedShifts(
           cand,
           paidShiftMins,
           date,
-          requiredCurve,
+          supReqCurve,
           currentScheduledCurve,
           config,
           intervalMins
@@ -444,18 +545,22 @@ export function assignCoverageOptimizedShifts(
 }
 
 /**
- * Function 1: buildContractWeekAssignments
+ * Function 1: assignWeeklyWorkOffPatterns / buildContractWeekAssignments
  * Assigns WORK / OFF / BUSINESS_CLOSED per agent per real calendar week driven by workDaysPerWeek and offDaysPerWeek.
+ * Enforces contract weeks without positional logic or multi-week horizon under-allocation bugs (P0-1 & P0-2).
  */
-export function buildContractWeekAssignments(
+export function assignWeeklyWorkOffPatterns(
   config: WorkforceConfig,
   agents: SyntheticAgent[],
   uniqueDates: string[],
   dailyPressureMap: Map<string, number>
 ): {
   contractWarnings: string[];
+  contractWeeks: ContractWeek[];
 } {
   const contractWarnings: string[] = [];
+  const weekStartsOn = config.weekStartsOn ?? 1; // 1 = Mon
+  const contractWeeks = buildContractWeeks(uniqueDates, weekStartsOn);
 
   const workDays = config.workDaysPerWeek ?? 5;
   const offDays = config.offDaysPerWeek ?? 2;
@@ -468,159 +573,319 @@ export function buildContractWeekAssignments(
 
   const offDaysTarget = Math.max(0, Math.min(6, offDays));
   const isDynamicTrend = config.offDistributionMode === 'dynamic_volume_trend';
+  const requireConsecutiveOff = config.requireConsecutiveOff !== false;
+  const maxConsecutiveWork = config.maxConsecutiveWorkDays ?? 6;
+  const minConsecutiveWork = config.minConsecutiveWorkDays ?? 2;
 
-  if (offDaysTarget === 0) {
-    // Everyone works every open day
-    for (let aIdx = 0; aIdx < agents.length; aIdx++) {
-      const agent = agents[aIdx];
-      const scheduleMap = agent.scheduleByDate as Record<string, AgentDayAssignment>;
-      for (let dIdx = 0; dIdx < uniqueDates.length; dIdx++) {
-        const date = uniqueDates[dIdx];
-        const comp = parseDateComponents(date);
-        const isClosedDay = !config.is24x7 && (
-          !isDateBusinessOperatingDay(date, config.operatingDays) ||
-          isDateHoliday(date, config.holidayDates)
-        );
-        scheduleMap[date] = {
-          date,
-          dayIndex: dIdx,
-          dayName: comp.dayName,
-          isOff: isClosedDay,
-          breaks: [],
-          plannedShrinkages: [],
-          adherenceWindows: [],
-        };
-      }
-    }
-    return { contractWarnings };
+  // Track consecutive working days per agent across weeks
+  const agentConsecutiveWorkDays = new Map<string, number>();
+  for (const ag of agents) {
+    agentConsecutiveWorkDays.set(ag.id, 0);
   }
 
-  // When we have unique dates
-  const totalAgents = agents.length;
-  const sortedDatesAscending = [...uniqueDates].sort((a, b) => {
-    return (dailyPressureMap.get(a) || 0) - (dailyPressureMap.get(b) || 0);
-  });
+  // Build contract week blocks: chunk uniqueDates into 7-day contract weeks with any remainder
+  const contractWeekBlocks: string[][] = [];
+  for (let i = 0; i < uniqueDates.length; i += 7) {
+    contractWeekBlocks.push(uniqueDates.slice(i, i + 7));
+  }
 
-  if (uniqueDates.length >= 7 && isDynamicTrend) {
-    // Build a distribution of off-slots across the 7 days:
-    // Lowest volume day gets the most off slots; highest volume day gets the fewest (but >= 1 if offDaysTarget > 0)
-    // Total slots to distribute across N agents = N * offDaysTarget
-    const totalOffSlots = totalAgents * offDaysTarget;
-    const numDays = uniqueDates.length;
-    
-    // Weights inversely proportional to workload rank
-    const weights: number[] = [];
-    for (let i = 0; i < numDays; i++) {
-      weights.push(numDays - i); // rank 0 has weight numDays, rank numDays-1 has weight 1
-    }
-    const sumWeights = weights.reduce((s, w) => s + w, 0);
+  for (let wIdx = 0; wIdx < contractWeekBlocks.length; wIdx++) {
+    const weekDates = contractWeekBlocks[wIdx];
+    const numDaysInWeek = weekDates.length;
+    const totalAgents = agents.length;
 
-    const slotsPerDay: number[] = [];
-    let assignedSlots = 0;
-    for (let i = 0; i < numDays; i++) {
-      const raw = Math.round((weights[i] / sumWeights) * totalOffSlots);
-      const guaranteed = Math.max(1, Math.min(totalAgents - 1, raw));
-      slotsPerDay.push(guaranteed);
-      assignedSlots += guaranteed;
-    }
+    if (numDaysInWeek === 7) {
+      // FULL CONTRACT WEEK (P0-1 & P0-2: Guaranteed exact weekly contract per agent)
+      if (offDaysTarget === 0) {
+        for (const ag of agents) {
+          const sched = ag.scheduleByDate as Record<string, AgentDayAssignment>;
+          let consWork = agentConsecutiveWorkDays.get(ag.id) || 0;
+          for (let dIdx = 0; dIdx < 7; dIdx++) {
+            const date = weekDates[dIdx];
+            const comp = parseDateComponents(date);
+            const isClosed = !config.is24x7 && (
+              !isDateBusinessOperatingDay(date, config.operatingDays) ||
+              isDateHoliday(date, config.holidayDates)
+            );
+            sched[date] = {
+              date,
+              dayIndex: wIdx * 7 + dIdx,
+              dayName: comp.dayName,
+              isOff: isClosed,
+              breaks: [],
+              plannedShrinkages: [],
+              adherenceWindows: [],
+            };
+            if (isClosed) consWork = 0;
+            else consWork++;
+          }
+          agentConsecutiveWorkDays.set(ag.id, consWork);
+        }
+        continue;
+      }
 
-    // Adjust residual
-    while (assignedSlots < totalOffSlots) {
-      slotsPerDay[0]++;
-      assignedSlots++;
-    }
-    while (assignedSlots > totalOffSlots) {
-      for (let i = numDays - 1; i >= 0; i--) {
-        if (slotsPerDay[i] > 1) {
-          slotsPerDay[i]--;
-          assignedSlots--;
-          if (assignedSlots === totalOffSlots) break;
+      // Generate candidate off patterns
+      let candidatePatterns: number[][] = [];
+      if (requireConsecutiveOff && offDaysTarget >= 2) {
+        for (let start = 0; start < 7; start++) {
+          const pat: number[] = [];
+          for (let k = 0; k < offDaysTarget; k++) {
+            pat.push((start + k) % 7);
+          }
+          candidatePatterns.push(pat);
+        }
+      } else if (offDaysTarget === 1) {
+        for (let day = 0; day < 7; day++) {
+          candidatePatterns.push([day]);
+        }
+      } else {
+        const getCombinations = (arr: number[], size: number): number[][] => {
+          if (size === 0) return [[]];
+          if (arr.length < size) return [];
+          const head = arr[0];
+          const rest = arr.slice(1);
+          const withHead = getCombinations(rest, size - 1).map(c => [head, ...c]);
+          const withoutHead = getCombinations(rest, size);
+          return [...withHead, ...withoutHead];
+        };
+        candidatePatterns = getCombinations([0, 1, 2, 3, 4, 5, 6], offDaysTarget);
+      }
+
+      // Daily off targets for this week
+      const totalOffSlotsInWeek = totalAgents * offDaysTarget;
+      const dailyTargets: number[] = new Array(7).fill(0);
+
+      if (isDynamicTrend) {
+        const weekPressures = weekDates.map(d => dailyPressureMap.get(d) || 1);
+        const dayIndices = [0, 1, 2, 3, 4, 5, 6].sort((a, b) => weekPressures[a] - weekPressures[b]);
+        const weights: number[] = new Array(7).fill(0);
+        for (let r = 0; r < 7; r++) {
+          weights[dayIndices[r]] = 7 - r;
+        }
+        const sumWeights = weights.reduce((s, w) => s + w, 0);
+
+        let assigned = 0;
+        for (let i = 0; i < 7; i++) {
+          const raw = Math.round((weights[i] / sumWeights) * totalOffSlotsInWeek);
+          const target = Math.max(1, Math.min(totalAgents - 1, raw));
+          dailyTargets[i] = target;
+          assigned += target;
+        }
+        while (assigned < totalOffSlotsInWeek) {
+          const minPDay = dayIndices[0];
+          dailyTargets[minPDay]++;
+          assigned++;
+        }
+        while (assigned > totalOffSlotsInWeek) {
+          for (let r = 6; r >= 0; r--) {
+            const highPDay = dayIndices[r];
+            if (dailyTargets[highPDay] > 1) {
+              dailyTargets[highPDay]--;
+              assigned--;
+              if (assigned === totalOffSlotsInWeek) break;
+            }
+          }
+        }
+      } else {
+        const perDay = Math.floor(totalOffSlotsInWeek / 7);
+        let rem = totalOffSlotsInWeek % 7;
+        for (let i = 0; i < 7; i++) {
+          dailyTargets[i] = perDay + (rem > 0 ? 1 : 0);
+          if (rem > 0) rem--;
         }
       }
-    }
 
-    // Build the slot lookup array
-    const slotToDate: string[] = [];
-    for (let i = 0; i < numDays; i++) {
-      const date = sortedDatesAscending[i];
-      for (let s = 0; s < slotsPerDay[i]; s++) {
-        slotToDate.push(date);
-      }
-    }
+      const currentAssignedOff = new Array(7).fill(0);
 
-    // Assign exactly offDaysTarget distinct off days per agent
-    for (let aIdx = 0; aIdx < totalAgents; aIdx++) {
-      const agent = agents[aIdx];
-      const scheduleMap = agent.scheduleByDate as Record<string, AgentDayAssignment>;
-      const agentOffDays = new Set<string>();
+      for (let aIdx = 0; aIdx < totalAgents; aIdx++) {
+        const ag = agents[aIdx];
+        const sched = ag.scheduleByDate as Record<string, AgentDayAssignment>;
+        const startConsWork = agentConsecutiveWorkDays.get(ag.id) || 0;
 
-      for (let k = 0; k < offDaysTarget; k++) {
-        const step = Math.floor(slotToDate.length / offDaysTarget);
-        let slotIdx = (aIdx + k * step) % slotToDate.length;
-        let dateCandidate = slotToDate[slotIdx];
-        
-        let attempts = 0;
-        while (agentOffDays.has(dateCandidate) && attempts < slotToDate.length) {
-          slotIdx = (slotIdx + 1) % slotToDate.length;
-          dateCandidate = slotToDate[slotIdx];
-          attempts++;
+        let bestPattern = candidatePatterns[0];
+        let bestScore = -Infinity;
+
+        for (let pIdx = 0; pIdx < candidatePatterns.length; pIdx++) {
+          const pat = candidatePatterns[pIdx];
+          const isOffDay = new Array(7).fill(false);
+          for (const d of pat) isOffDay[d] = true;
+
+          let score = 0;
+
+          let consWork = startConsWork;
+          let maxConsInWeek = consWork;
+          let minConsWorkViolation = false;
+
+          let currentWorkRun = 0;
+          for (let d = 0; d < 7; d++) {
+            if (!isOffDay[d]) {
+              consWork++;
+              currentWorkRun++;
+              if (consWork > maxConsInWeek) maxConsInWeek = consWork;
+            } else {
+              if (currentWorkRun > 0 && currentWorkRun < minConsecutiveWork) {
+                if (d - currentWorkRun === 0 && startConsWork > 0 && (startConsWork + currentWorkRun) >= minConsecutiveWork) {
+                  // Valid run connected to previous week
+                } else {
+                  minConsWorkViolation = true;
+                }
+              }
+              consWork = 0;
+              currentWorkRun = 0;
+            }
+          }
+
+          if (maxConsInWeek > maxConsecutiveWork) {
+            score -= (maxConsInWeek - maxConsecutiveWork) * 100;
+          }
+          if (minConsWorkViolation) {
+            score -= 20;
+          }
+
+          for (const d of pat) {
+            const deficit = dailyTargets[d] - currentAssignedOff[d];
+            if (deficit > 0) {
+              score += deficit * 10;
+            } else {
+              score -= 15;
+            }
+          }
+
+          const phaseOffset = (aIdx + pIdx) % candidatePatterns.length;
+          score += (candidatePatterns.length - phaseOffset) * 0.1;
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestPattern = pat;
+          }
         }
-        agentOffDays.add(dateCandidate);
+
+        const chosenOffSet = new Set<number>(bestPattern);
+        for (const d of bestPattern) {
+          currentAssignedOff[d]++;
+        }
+
+        let endConsWork = startConsWork;
+        for (let d = 0; d < 7; d++) {
+          const date = weekDates[d];
+          const comp = parseDateComponents(date);
+          const isClosed = !config.is24x7 && (
+            !isDateBusinessOperatingDay(date, config.operatingDays) ||
+            isDateHoliday(date, config.holidayDates)
+          );
+          const isOff = isClosed || chosenOffSet.has(d);
+
+          sched[date] = {
+            date,
+            dayIndex: wIdx * 7 + d,
+            dayName: comp.dayName,
+            isOff,
+            breaks: [],
+            plannedShrinkages: [],
+            adherenceWindows: [],
+          };
+
+          if (isOff) {
+            endConsWork = 0;
+          } else {
+            endConsWork++;
+          }
+        }
+        agentConsecutiveWorkDays.set(ag.id, endConsWork);
+      }
+    } else {
+      // PARTIAL HORIZON / WEEK (1 to 6 days)
+      const totalOffSlotsInChunk = Math.round(totalAgents * (offDaysTarget / 7) * numDaysInWeek);
+      const dailyTargets: number[] = new Array(numDaysInWeek).fill(0);
+
+      if (numDaysInWeek === 1) {
+        dailyTargets[0] = Math.min(totalAgents, totalOffSlotsInChunk);
+      } else if (isDynamicTrend) {
+        const chunkPressures = weekDates.map(d => dailyPressureMap.get(d) || 1);
+        const dayIndices = Array.from({ length: numDaysInWeek }, (_, i) => i).sort((a, b) => chunkPressures[a] - chunkPressures[b]);
+        const weights: number[] = new Array(numDaysInWeek).fill(0);
+        for (let r = 0; r < numDaysInWeek; r++) {
+          weights[dayIndices[r]] = numDaysInWeek - r;
+        }
+        const sumW = weights.reduce((s, w) => s + w, 0);
+        let assigned = 0;
+        for (let i = 0; i < numDaysInWeek; i++) {
+          const t = Math.min(totalAgents - 1, Math.round((weights[i] / sumW) * totalOffSlotsInChunk));
+          dailyTargets[i] = t;
+          assigned += t;
+        }
+        while (assigned < totalOffSlotsInChunk) {
+          dailyTargets[dayIndices[0]]++;
+          assigned++;
+        }
+      } else {
+        const perDay = Math.floor(totalOffSlotsInChunk / numDaysInWeek);
+        let rem = totalOffSlotsInChunk % numDaysInWeek;
+        for (let i = 0; i < numDaysInWeek; i++) {
+          dailyTargets[i] = perDay + (rem > 0 ? 1 : 0);
+          if (rem > 0) rem--;
+        }
       }
 
-      for (let dIdx = 0; dIdx < uniqueDates.length; dIdx++) {
-        const date = uniqueDates[dIdx];
-        const comp = parseDateComponents(date);
-        const isClosedDay = !config.is24x7 && (
-          !isDateBusinessOperatingDay(date, config.operatingDays) ||
-          isDateHoliday(date, config.holidayDates)
-        );
+      const currentAssignedOff = new Array(numDaysInWeek).fill(0);
 
-        scheduleMap[date] = {
-          date,
-          dayIndex: dIdx,
-          dayName: comp.dayName,
-          isOff: isClosedDay || agentOffDays.has(date),
-          breaks: [],
-          plannedShrinkages: [],
-          adherenceWindows: [],
-        };
-      }
-    }
-  } else {
-    // Flat rotation / partial horizon
-    for (let aIdx = 0; aIdx < totalAgents; aIdx++) {
-      const agent = agents[aIdx];
-      const scheduleMap = agent.scheduleByDate as Record<string, AgentDayAssignment>;
+      for (let aIdx = 0; aIdx < totalAgents; aIdx++) {
+        const ag = agents[aIdx];
+        const sched = ag.scheduleByDate as Record<string, AgentDayAssignment>;
+        let consWork = agentConsecutiveWorkDays.get(ag.id) || 0;
 
-      for (let dIdx = 0; dIdx < uniqueDates.length; dIdx++) {
-        const date = uniqueDates[dIdx];
-        const comp = parseDateComponents(date);
-        const dayOfWeekIndex = (comp.dayOfWeek + 6) % 7; // 0=Mon, ..., 6=Sun
-        const isClosedDay = !config.is24x7 && (
-          !isDateBusinessOperatingDay(date, config.operatingDays) ||
-          isDateHoliday(date, config.holidayDates)
-        );
+        // Choose which day(s) this agent takes off based on daily deficit
+        let agentOffDay = -1;
+        if (totalOffSlotsInChunk > 0) {
+          let maxDeficit = 0;
+          let bestD = -1;
+          for (let d = 0; d < numDaysInWeek; d++) {
+            const def = dailyTargets[d] - currentAssignedOff[d];
+            if (def > maxDeficit) {
+              maxDeficit = def;
+              bestD = d;
+            }
+          }
+          if (bestD >= 0) {
+            agentOffDay = bestD;
+            currentAssignedOff[bestD]++;
+          }
+        }
 
-        const cycleIdx = uniqueDates.length >= 7 ? dayOfWeekIndex : dIdx;
-        const agentPhase = (cycleIdx + aIdx) % 7;
-        const isOffRotational = agentPhase < offDaysTarget;
+        for (let d = 0; d < numDaysInWeek; d++) {
+          const date = weekDates[d];
+          const comp = parseDateComponents(date);
+          const isClosed = !config.is24x7 && (
+            !isDateBusinessOperatingDay(date, config.operatingDays) ||
+            isDateHoliday(date, config.holidayDates)
+          );
+          const isOff = isClosed || (d === agentOffDay);
 
-        scheduleMap[date] = {
-          date,
-          dayIndex: dIdx,
-          dayName: comp.dayName,
-          isOff: isClosedDay || isOffRotational,
-          breaks: [],
-          plannedShrinkages: [],
-          adherenceWindows: [],
-        };
+          sched[date] = {
+            date,
+            dayIndex: wIdx * 7 + d,
+            dayName: comp.dayName,
+            isOff,
+            breaks: [],
+            plannedShrinkages: [],
+            adherenceWindows: [],
+          };
+
+          if (isOff) {
+            consWork = 0;
+          } else {
+            consWork++;
+          }
+        }
+        agentConsecutiveWorkDays.set(ag.id, consWork);
       }
     }
   }
 
-  return { contractWarnings };
+  return { contractWarnings, contractWeeks };
 }
+
+export const buildContractWeekAssignments = assignWeeklyWorkOffPatterns;
 
 /**
  * Computes agent total paid hours for a weekly period
@@ -810,10 +1075,95 @@ export function validateContractWeek(
     });
   }
 
+  const offDaysTarget = Math.max(0, Math.min(6, offDays));
+  const weekStartsOn = config.weekStartsOn ?? 1;
+  const contractWeeks = buildContractWeeks(uniqueDates, weekStartsOn);
+  const requireConsecutiveOff = config.requireConsecutiveOff !== false;
   const maxConsecutiveWork = config.maxConsecutiveWorkDays ?? 6;
+  const minConsecutiveWork = config.minConsecutiveWorkDays ?? 2;
   const minRestHours = config.minRestHoursBetweenShifts ?? 12;
+  const paidShiftHours = config.dailyPaidHours ?? 8;
+
   const agentsWithViolations = new Set<string>();
 
+  // Shift length bounds check (Part 10 & 24)
+  if (config.minShiftHours !== undefined && paidShiftHours < config.minShiftHours) {
+    for (const ag of agents) {
+      agentViolations.push({
+        agentId: ag.id,
+        type: 'SHIFT_LENGTH_VIOLATION',
+        message: `Agent ${ag.id} daily paid hours (${paidShiftHours}h) is below configured minShiftHours (${config.minShiftHours}h)`,
+      });
+      agentsWithViolations.add(ag.id);
+    }
+  }
+  if (config.maxShiftHours !== undefined && paidShiftHours > config.maxShiftHours) {
+    for (const ag of agents) {
+      agentViolations.push({
+        agentId: ag.id,
+        type: 'SHIFT_LENGTH_VIOLATION',
+        message: `Agent ${ag.id} daily paid hours (${paidShiftHours}h) exceeds configured maxShiftHours (${config.maxShiftHours}h)`,
+      });
+      agentsWithViolations.add(ag.id);
+    }
+  }
+
+  // 1. Validate exact OFF / WORK days and consecutive OFF per agent per full contract week (P0-1, P0-2, Part 17, Part 18)
+  for (const cWeek of contractWeeks) {
+    if (cWeek.isFullWeek) {
+      for (const agent of agents) {
+        const schedule = agent.scheduleByDate as Record<string, AgentDayAssignment>;
+        const offDayIndices: number[] = [];
+        for (let d = 0; d < 7; d++) {
+          const date = cWeek.dates[d];
+          const day = schedule[date];
+          if (day && day.isOff) {
+            offDayIndices.push(d);
+          }
+        }
+
+        if (offDayIndices.length !== offDaysTarget) {
+          contractViolations.push({
+            agentId: agent.id,
+            type: 'OFF_DAYS_CONTRACT_VIOLATION',
+            message: `Agent ${agent.id} assigned ${offDayIndices.length} OFF days in Week ${cWeek.weekIndex + 1} (${cWeek.startDate} - ${cWeek.endDate}), expected contractual target of ${offDaysTarget}`,
+          });
+          agentsWithViolations.add(agent.id);
+        }
+
+        // Check consecutive off (Part 18)
+        if (requireConsecutiveOff && offDaysTarget >= 2 && offDayIndices.length >= 2) {
+          const sorted = [...offDayIndices].sort((a, b) => a - b);
+          let isConsecutive = true;
+          // Linear consecutive
+          let linearCons = true;
+          for (let k = 1; k < sorted.length; k++) {
+            if (sorted[k] !== sorted[k - 1] + 1) {
+              linearCons = false;
+              break;
+            }
+          }
+          // Wrap-around consecutive (e.g. [0, 6] for Sun/Mon when week starts on Mon)
+          let wrapCons = false;
+          if (!linearCons && sorted.length === 2 && sorted[0] === 0 && sorted[1] === 6) {
+            wrapCons = true;
+          }
+          isConsecutive = linearCons || wrapCons;
+
+          if (!isConsecutive) {
+            contractViolations.push({
+              agentId: agent.id,
+              type: 'CONSECUTIVE_OFF_VIOLATION',
+              message: `Agent ${agent.id} OFF days in Week ${cWeek.weekIndex + 1} are non-consecutive (${sorted.map(idx => parseDateComponents(cWeek.dates[idx]).dayName).join(', ')}) with requireConsecutiveOff enabled`,
+            });
+            agentsWithViolations.add(agent.id);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Validate consecutive work, isolated work days, and rest rules across chronological dates
   for (const agent of agents) {
     const schedule = agent.scheduleByDate as Record<string, AgentDayAssignment>;
     let consecutiveWork = 0;
@@ -852,11 +1202,21 @@ export function validateContractWeek(
           }
         }
       } else {
+        if (consecutiveWork > 0 && consecutiveWork < minConsecutiveWork) {
+          agentViolations.push({
+            agentId: agent.id,
+            type: 'MIN_CONSECUTIVE_WORK_VIOLATION',
+            message: `Agent ${agent.id} has an isolated work run of ${consecutiveWork} day(s) before ${date} (< minConsecutiveWorkDays ${minConsecutiveWork})`,
+            date,
+          });
+          agentsWithViolations.add(agent.id);
+        }
         consecutiveWork = 0;
       }
     }
   }
 
+  // 3. Validate team off-pattern deviation and supervisor shift alignment
   const teamsMap = new Map<number, SyntheticAgent[]>();
   for (const ag of agents) {
     if (!teamsMap.has(ag.teamId)) teamsMap.set(ag.teamId, []);
@@ -923,6 +1283,7 @@ export function validateContractWeek(
     }
   }
 
+  // 4. Validate interval undercoverage
   if (intervalStaffing) {
     for (const staff of intervalStaffing) {
       const minHC = staff.minHC ?? (config.minCoverage !== undefined ? (config.minCoverage < 1 ? staff.requiredHC * config.minCoverage : config.minCoverage) : staff.requiredHC);
@@ -1087,6 +1448,46 @@ export function auditRosterFeasibility(
         'Reduce team shift rotation volatility',
         'Lower min rest requirement if permitted by local labor regulations',
       ],
+    });
+  }
+
+  // Business Window Authoritative Check (Part 9 & 23)
+  if (!config.is24x7) {
+    const bStart = timeToMinutes(config.businessHoursStart || '08:00');
+    const bEnd = timeToMinutes(config.businessHoursEnd || '20:00');
+    if (earliestDemandMin < bStart || latestDemandMin > bEnd) {
+      issues.push({
+        severity: 'soft_warning',
+        category: 'business_window',
+        title: 'Demand Arriving Outside Configured Business Hours',
+        description: `Demand detected at ${minutesToTime(earliestDemandMin)}–${minutesToTime(latestDemandMin)}, which extends outside configured business hours (${config.businessHoursStart || '08:00'}–${config.businessHoursEnd || '20:00'}). Shift starts remain constrained to authoritative business hours.`,
+        remedies: [
+          'Expand business hours in configuration',
+          'Enable 24x7 operating mode',
+          'Filter out-of-hours demand rows',
+        ],
+      });
+    }
+  }
+
+  // Shift length bounds check (Part 10 & 24)
+  const paidShiftHours = config.dailyPaidHours ?? 8;
+  if (config.minShiftHours !== undefined && paidShiftHours < config.minShiftHours) {
+    issues.push({
+      severity: 'hard_violation',
+      category: 'consecutive_work',
+      title: 'Shift Duration Below Configured Minimum',
+      description: `Daily paid hours (${paidShiftHours}h) is less than configured minShiftHours (${config.minShiftHours}h).`,
+      remedies: ['Increase daily paid hours', 'Lower minShiftHours constraint'],
+    });
+  }
+  if (config.maxShiftHours !== undefined && paidShiftHours > config.maxShiftHours) {
+    issues.push({
+      severity: 'hard_violation',
+      category: 'consecutive_work',
+      title: 'Shift Duration Exceeds Configured Maximum',
+      description: `Daily paid hours (${paidShiftHours}h) exceeds configured maxShiftHours (${config.maxShiftHours}h).`,
+      remedies: ['Reduce daily paid hours', 'Increase maxShiftHours constraint'],
     });
   }
 
@@ -1311,10 +1712,10 @@ export function generateRoster(
   const operatingWindow = { startMin: minDemandMin, endMin: maxDemandMin };
 
   // 1. Build Required Coverage Curve & Daily Pressure
-  const { requiredCurve, dailyPressureMap } = buildRequiredCoverageCurve(demands, config);
+  const { requiredCurve, resourceRequirements, dailyPressureMap } = buildRequiredCoverageCurve(demands, config);
 
   // 2. Assign Contract Week WORK / OFF days (P0-1 & P0-2)
-  buildContractWeekAssignments(config, agents, uniqueDates, dailyPressureMap);
+  assignWeeklyWorkOffPatterns(config, agents, uniqueDates, dailyPressureMap);
 
   // 3. Assign Coverage-Optimized Shifts per Working Date (P0-3 & P0-4)
   const currentScheduledCurve = new Map<string, number>();
@@ -1335,7 +1736,8 @@ export function generateRoster(
       operatingWindow,
       demands[0]?.intervalMinutes || 30,
       dIdx,
-      uniqueDates
+      uniqueDates,
+      resourceRequirements
     );
   }
 

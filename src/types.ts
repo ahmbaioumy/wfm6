@@ -158,6 +158,7 @@ export interface WorkforceConfig {
   missingDataStrategy: MissingDataStrategy;
   intervalMinutesOverride?: number; // 0: Auto Detect, 15, 30, 60
   weekStartDay: WeekStartDay; // 1: Monday, 0: Sunday, 6: Saturday
+  weekStartsOn?: number; // 0..6 alias for weekStartDay
 
   // Break & Shift configurations (explicit parameters, no hidden assumptions)
   breakDurationMinutes?: number; // Explicit break minutes (overrides percentage if set)
@@ -315,9 +316,18 @@ export interface RosterValidationResult {
   };
 }
 
+export interface ContractWeek {
+  weekIndex: number;
+  startDate: string;
+  endDate: string;
+  dates: string[];
+  isFullWeek: boolean;
+  type: 'FULL_WEEK' | 'PARTIAL_WEEK';
+}
+
 export interface FeasibilityIssue {
   severity: 'hard_violation' | 'soft_warning' | 'info';
-  category: 'gender_curfew' | 'rest_rule' | 'team_deviation' | 'coverage' | 'shift_length' | 'horizon_partial' | 'contract';
+  category: 'gender_curfew' | 'rest_rule' | 'team_deviation' | 'coverage' | 'shift_length' | 'horizon_partial' | 'contract' | 'business_window' | 'consecutive_work' | 'consecutive_off';
   title: string;
   description: string;
   remedies: string[];

@@ -616,8 +616,9 @@ export function runSingleSimulation(
         }
       }
     } else {
-      // For shared pool agents, record to pool interval available map
+      // For shared pool agents, record to pool interval available map (1 agent available = 1 pool available second)
       const pKey = ag.poolId || 'shared_pool';
+      const recordedIntervals = new Set<string>();
       for (const seg of ag.skills) {
         const intervals = demandsBySegment.get(seg);
         if (!intervals) continue;
@@ -630,8 +631,10 @@ export function runSingleSimulation(
           if (oEnd > oStart) {
             const timeKey = `${inv.d.date}__${inv.d.intervalStart}`;
             const poolKey = `${pKey}__${timeKey}`;
-            // Apportion to pool time once per interval (1 agent available = 1 pool available second)
-            poolIntervalAvailMap.set(poolKey, (poolIntervalAvailMap.get(poolKey) || 0) + ((oEnd - oStart) / ag.skills.size));
+            if (!recordedIntervals.has(poolKey)) {
+              recordedIntervals.add(poolKey);
+              poolIntervalAvailMap.set(poolKey, (poolIntervalAvailMap.get(poolKey) || 0) + (oEnd - oStart));
+            }
           }
         }
       }
