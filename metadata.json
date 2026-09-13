@@ -1,0 +1,6 @@
+{
+  "name": "Contact Center Performance Simulator",
+  "description": "Discrete Event Simulation & WFM Roster Performance Engine converting Demand and Headcount into SLA, ASA, Occupancy, and Queue Dynamics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
