@@ -429,7 +429,7 @@ export function runSingleSimulation(
   const normRosterEvents: NormalizedRosterEvent[] = [];
   if (rosterEvents && rosterEvents.length > 0) {
     for (const rev of rosterEvents) {
-      const simSec = rev.timestamp - baseTimestamp;
+      const simSec = rev.timestamp > 100000000 ? rev.timestamp - baseTimestamp : rev.timestamp;
       normRosterEvents.push({
         timestamp: simSec,
         agentId: rev.agentId,
@@ -825,6 +825,7 @@ export function runSingleSimulation(
     }
 
     // Priority 2: Roster availability state changes
+    const changedAgents = new Set<DesAgent>();
     while (rosterCursor < normRosterEvents.length && normRosterEvents[rosterCursor].timestamp <= simClock) {
       const rev = normRosterEvents[rosterCursor];
       const ag = agentMap.get(rev.agentId);
@@ -834,12 +835,7 @@ export function runSingleSimulation(
             ag.status = 'AVAILABLE';
             ag.shiftEnded = false;
             ag.availableSince = simClock;
-            while (ag.activeContacts.length < ag.concurrency) {
-              if (!tryAssignAgent(ag, simClock)) break;
-            }
-            if (ag.activeContacts.length > 0) {
-              ag.availableSince = undefined;
-            }
+            changedAgents.add(ag);
             break;
           case 'SHIFT_END':
             ag.shiftEnded = true;
@@ -847,52 +843,52 @@ export function runSingleSimulation(
             if (ag.activeContacts.length === 0) {
               ag.status = 'OFF';
             }
+            changedAgents.delete(ag);
             break;
           case 'BREAK_START':
             flushAgentAvailableTime(ag, simClock);
             ag.status = 'ON_BREAK';
+            changedAgents.delete(ag);
             break;
           case 'BREAK_END':
             ag.status = 'AVAILABLE';
             ag.availableSince = simClock;
-            while (ag.activeContacts.length < ag.concurrency) {
-              if (!tryAssignAgent(ag, simClock)) break;
-            }
-            if (ag.activeContacts.length > 0) {
-              ag.availableSince = undefined;
-            }
+            changedAgents.add(ag);
             break;
           case 'SHRINKAGE_START':
             flushAgentAvailableTime(ag, simClock);
             ag.status = 'SHRINKAGE';
+            changedAgents.delete(ag);
             break;
           case 'SHRINKAGE_END':
             ag.status = 'AVAILABLE';
             ag.availableSince = simClock;
-            while (ag.activeContacts.length < ag.concurrency) {
-              if (!tryAssignAgent(ag, simClock)) break;
-            }
-            if (ag.activeContacts.length > 0) {
-              ag.availableSince = undefined;
-            }
+            changedAgents.add(ag);
             break;
           case 'ADHERENCE_START':
             flushAgentAvailableTime(ag, simClock);
             ag.status = 'UNADHERENT';
+            changedAgents.delete(ag);
             break;
           case 'ADHERENCE_END':
             ag.status = 'AVAILABLE';
             ag.availableSince = simClock;
-            while (ag.activeContacts.length < ag.concurrency) {
-              if (!tryAssignAgent(ag, simClock)) break;
-            }
-            if (ag.activeContacts.length > 0) {
-              ag.availableSince = undefined;
-            }
+            changedAgents.add(ag);
             break;
         }
       }
       rosterCursor++;
+    }
+
+    for (const ag of changedAgents) {
+      if (ag.status === 'AVAILABLE') {
+        while (ag.activeContacts.length < ag.concurrency) {
+          if (!tryAssignAgent(ag, simClock)) break;
+        }
+        if (ag.activeContacts.length > 0) {
+          ag.availableSince = undefined;
+        }
+      }
     }
 
     // Priority 3: Abandonment deadlines
@@ -1004,18 +1000,34 @@ export function runSingleSimulation(
     const abnNum = config.excludeShortAbandons ? Math.max(0, abn - shAbn) : abn;
     const abandonPercent = abnDenom > 0 ? Number(((abnNum / abnDenom) * 100).toFixed(1)) : 0.0;
 
-    // Occupancy % calculation (P0-5 Shared Pool Occupancy)
-    // For shared/blended resources calculate occupancy primarily at POOL level:
-    // Pool Busy / (Pool Busy + Pool Available).
-    // Dedicated queues have segment occupancy.
+    // Occupancy % calculation (P0-5 Shared Pool Occupancy & P0-10 Multi-Slot Concurrency)
     const seg = d.segment;
     const isShared = config.segmentConfigs?.[seg]?.allocationType === 'shared';
     const poolId = config.segmentConfigs?.[seg]?.poolId || (isShared ? 'shared_pool' : undefined);
+    const segChannel = config.segmentConfigs?.[seg]?.channel || d.channel || 'voice';
+    let segConcurrency = 1;
+    if (segChannel === 'chat') {
+      segConcurrency = Math.max(1, config.segmentConfigs?.[seg]?.concurrency || config.chatConcurrency || 3);
+    }
+
+    // Roster staff for this interval
+    const staffKey = `${d.date}__${d.intervalStart}__${d.segment}`;
+    const staff = staffingMap.get(staffKey) || staffingMap.get(`${d.intervalStart}__${d.segment}`);
+    const scheduledHC = staff ? staff.scheduledHC : 0;
+    const effectiveHC = staff ? staff.effectiveHC : 0;
 
     let occupancyPercent = 0.0;
     let finalAvailSec = availSec;
 
-    if (poolId) {
+    if (segConcurrency > 1) {
+      // Chat multi-slot capacity
+      const intDurationSec = (d.intervalMinutes || 30) * 60;
+      const onDutySec = Math.max(availSec + (busySec / segConcurrency), effectiveHC * intDurationSec);
+      const totalSlotSec = onDutySec * segConcurrency;
+      occupancyPercent = totalSlotSec > 0 ? Number(Math.min(100, (busySec / totalSlotSec) * 100).toFixed(4)) : 0.0;
+      finalAvailSec = Math.max(0, onDutySec - (busySec / segConcurrency));
+      availableSecArray[i] = finalAvailSec;
+    } else if (poolId) {
       const timeKey = `${d.date}__${d.intervalStart}`;
       const pKey = `${poolId}__${timeKey}`;
       const pBusy = poolIntervalBusyMap.get(pKey) || 0;
@@ -1035,12 +1047,6 @@ export function runSingleSimulation(
       const occDenom = busySec + availSec;
       occupancyPercent = occDenom > 0 ? Number(Math.min(100, (busySec / occDenom) * 100).toFixed(1)) : 0.0;
     }
-
-    // Roster staff for this interval
-    const staffKey = `${d.date}__${d.intervalStart}__${d.segment}`;
-    const staff = staffingMap.get(staffKey) || staffingMap.get(`${d.intervalStart}__${d.segment}`);
-    const scheduledHC = staff ? staff.scheduledHC : 0;
-    const effectiveHC = staff ? staff.effectiveHC : 0;
 
     // Erlang Benchmark
     const erlangReq = solveRequiredStaffing(

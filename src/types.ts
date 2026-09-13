@@ -289,9 +289,35 @@ export interface AgentWeeklySchedule {
   ruleViolations?: string[];
 }
 
+export interface RosterViolation {
+  category: 'contract' | 'rest_rule' | 'consecutive_work' | 'consecutive_off' | 'team_deviation' | 'officer_shift' | 'gender_curfew' | 'min_coverage' | 'shift_length';
+  severity: 'hard_violation' | 'soft_warning' | 'info';
+  agentId?: string;
+  teamId?: number;
+  team?: string;
+  date?: string;
+  interval?: string;
+  title: string;
+  description: string;
+  remedies?: string[];
+}
+
+export interface RosterValidationResult {
+  agentViolations: Array<{ agentId: string; type: string; message: string; date?: string }>;
+  coverageViolations: Array<{ date: string; interval: string; requiredHC: number; scheduledHC: number; minHC: number; message: string }>;
+  teamViolations: Array<{ teamId: number; team: string; type: string; message: string }>;
+  contractViolations: Array<{ agentId?: string; type: string; message: string }>;
+  summary: {
+    agentsTotal: number;
+    agentsCompliant: number;
+    violationsTotal: number;
+    compliancePercent: number;
+  };
+}
+
 export interface FeasibilityIssue {
   severity: 'hard_violation' | 'soft_warning' | 'info';
-  category: 'gender_curfew' | 'rest_rule' | 'team_deviation' | 'coverage' | 'shift_length' | 'horizon_partial';
+  category: 'gender_curfew' | 'rest_rule' | 'team_deviation' | 'coverage' | 'shift_length' | 'horizon_partial' | 'contract';
   title: string;
   description: string;
   remedies: string[];
@@ -309,6 +335,7 @@ export interface WeeklyRosterPlan {
   flexibleShrinkagePoolPercent: number;
   agentSchedules: AgentWeeklySchedule[];
   feasibilityIssues?: FeasibilityIssue[];
+  validationResult?: RosterValidationResult;
 }
 
 export interface IntervalStaffing {
@@ -318,6 +345,8 @@ export interface IntervalStaffing {
   segment?: string;
   id?: string;
   requiredHC: number;
+  targetHC?: number;
+  minHC?: number;
   scheduledHC: number;
   effectiveHC: number;
   onShift: number;
@@ -327,6 +356,8 @@ export interface IntervalStaffing {
   outOfficeLoss?: number;
   adherenceLoss: number;
   coverageGap?: number;
+  gapToTarget?: number;
+  gapToMinimum?: number;
   coveragePercent?: number;
 }
 

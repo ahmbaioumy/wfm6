@@ -140,8 +140,8 @@ export function solveReverseModeHC(
   const theoreticalMinHC = Math.ceil(totalWorkloadHours / Math.max(1, dailyPaid * workDaysRatio));
 
   let lowHC = Math.max(5, Math.round(theoreticalMinHC * 0.7));
-  let highHC = Math.min(500, Math.max(lowHC + 30, Math.round(Math.max(theoreticalMinHC * 2.2, peakErlang * 3))));
-  const hardCapHC = 1000;
+  let highHC = Math.min(300, Math.max(lowHC + 30, Math.round(Math.max(theoreticalMinHC * 2.2, peakErlang * 3))));
+  const hardCapHC = 350;
 
   const iterations: Array<{ hc: number; sla: number }> = [];
 
