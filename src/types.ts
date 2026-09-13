@@ -80,12 +80,14 @@ export interface WorkforceConfig {
   totalHC: number;
   segmentHC: Record<string, number>;
   segmentConfigs?: Record<string, SegmentConfig>;
+  poolConfigs?: Record<string, { headcount: number; sharedSegments: string[] }>;
   headcountAllocationMode?: 'common' | 'dedicated' | 'shared' | 'blended';
 
   // Shifts and schedules
   dailyPaidHours: number; // e.g. 8
   workDaysPerWeek: number; // e.g. 6 (or 5)
   offDaysPerWeek: number; // e.g. 1 (or 2, or 0)
+  contractType?: string; // e.g. "5/2", "6/1", "7/0"
   shiftStartStepMinutes: number; // 15, 30, or 60
   minCoverage: number; // e.g. 1 or 2
   maxCoverage?: number;

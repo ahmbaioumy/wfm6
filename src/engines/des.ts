@@ -296,10 +296,29 @@ export function runSingleSimulation(
 
     const slaThreshold = config.segmentConfigs?.[d.segment]?.slaThresholdSeconds ?? config.slaThresholdSeconds;
     const defaultPatience = config.segmentConfigs?.[d.segment]?.defaultPatienceSeconds ?? config.defaultPatienceSeconds;
+    const segChannel = config.segmentConfigs?.[d.segment]?.channel || d.channel || 'voice';
+    let segConcurrency = 1;
+    if (segChannel === 'chat') {
+      segConcurrency = Math.max(1, config.segmentConfigs?.[d.segment]?.concurrency || config.chatConcurrency || 3);
+    }
 
     const arrivalOffsets: number[] = [];
-    for (let c = 0; c < count; c++) {
-      arrivalOffsets.push(prng.uniform(0, intDurationSec));
+    if (config.arrivalMode === 'fixed_forecast') {
+      if (count <= segConcurrency && segConcurrency > 1) {
+        // Multi-slot chat fixed forecast arrives simultaneously at interval start
+        for (let c = 0; c < count; c++) {
+          arrivalOffsets.push(0);
+        }
+      } else {
+        const step = intDurationSec / Math.max(1, count);
+        for (let c = 0; c < count; c++) {
+          arrivalOffsets.push(c * step);
+        }
+      }
+    } else {
+      for (let c = 0; c < count; c++) {
+        arrivalOffsets.push(prng.uniform(0, intDurationSec));
+      }
     }
     arrivalOffsets.sort((a, b) => a - b);
 
@@ -955,8 +974,9 @@ export function runSingleSimulation(
   }
 
   // Flush any remaining active available time at simulation finish
+  const finalHorizonSec = Math.max(simClock, horizonEndSec);
   for (const ag of agents) {
-    flushAgentAvailableTime(ag, simClock);
+    flushAgentAvailableTime(ag, finalHorizonSec);
   }
 
   // 6. Assemble Interval Results
@@ -1047,8 +1067,12 @@ export function runSingleSimulation(
       }
       availableSecArray[i] = finalAvailSec;
     } else {
-      const occDenom = busySec + availSec;
+      const intDurationSec = (d.intervalMinutes || 30) * 60;
+      const onDutySec = Math.max(busySec + availSec, effectiveHC * intDurationSec);
+      const occDenom = onDutySec > 0 ? onDutySec : (busySec + availSec);
       occupancyPercent = occDenom > 0 ? Number(Math.min(100, (busySec / occDenom) * 100).toFixed(1)) : 0.0;
+      finalAvailSec = Math.max(0, onDutySec - busySec);
+      availableSecArray[i] = finalAvailSec;
     }
 
     // Erlang Benchmark

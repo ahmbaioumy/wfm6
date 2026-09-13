@@ -583,18 +583,14 @@ export function assignWeeklyWorkOffPatterns(
     agentConsecutiveWorkDays.set(ag.id, 0);
   }
 
-  // Build contract week blocks: chunk uniqueDates into 7-day contract weeks with any remainder
-  const contractWeekBlocks: string[][] = [];
-  for (let i = 0; i < uniqueDates.length; i += 7) {
-    contractWeekBlocks.push(uniqueDates.slice(i, i + 7));
-  }
-
-  for (let wIdx = 0; wIdx < contractWeekBlocks.length; wIdx++) {
-    const weekDates = contractWeekBlocks[wIdx];
+  // Iterate directly over real calendar contract weeks from buildContractWeeks (P0-1 & P0-2)
+  for (let wIdx = 0; wIdx < contractWeeks.length; wIdx++) {
+    const cWeek = contractWeeks[wIdx];
+    const weekDates = cWeek.dates;
     const numDaysInWeek = weekDates.length;
     const totalAgents = agents.length;
 
-    if (numDaysInWeek === 7) {
+    if (cWeek.isFullWeek && numDaysInWeek === 7) {
       // FULL CONTRACT WEEK (P0-1 & P0-2: Guaranteed exact weekly contract per agent)
       if (offDaysTarget === 0) {
         for (const ag of agents) {
@@ -1070,8 +1066,8 @@ export function validateContractWeek(
 
   if (workDays + offDays !== 7) {
     contractViolations.push({
-      type: 'CONTRACT_CONFIGURATION_WARNING',
-      message: `Work Days = ${workDays}, OFF Days = ${offDays}, Total = ${workDays + offDays}, Expected contractual week = 7`,
+      type: 'CONTRACT_CONFIGURATION_ERROR',
+      message: `CONTRACT_CONFIGURATION_ERROR: Work Days = ${workDays}, OFF Days = ${offDays}, Total = ${workDays + offDays}, Expected contractual week = 7`,
     });
   }
 
@@ -1696,28 +1692,26 @@ export function generateRoster(
     }
   }
 
-  let minDemandMin = 24 * 60;
-  let maxDemandMin = 0;
-  for (const d of demands) {
-    const m = timeToMinutes(d.intervalStart);
-    const mEnd = m + (d.intervalMinutes || 30);
-    if (m < minDemandMin) minDemandMin = m;
-    if (mEnd > maxDemandMin) maxDemandMin = mEnd;
-  }
-  if (minDemandMin >= maxDemandMin) {
-    minDemandMin = timeToMinutes(config.businessHoursStart || '08:00');
-    maxDemandMin = timeToMinutes(config.businessHoursEnd || '20:00');
+  // Part 10: Authoritative Business Operating Window (never mutated by demand timestamps)
+  let bStartMin = timeToMinutes(config.businessHoursStart || '08:00');
+  let bEndMin = timeToMinutes(config.businessHoursEnd || '20:00');
+  if (config.is24x7) {
+    bStartMin = 0;
+    bEndMin = 1440;
+  } else if (bEndMin <= bStartMin) {
+    // Overnight window (e.g. 20:00 - 06:00)
+    bEndMin += 1440;
   }
 
-  const operatingWindow = { startMin: minDemandMin, endMin: maxDemandMin };
+  const operatingWindow = { startMin: bStartMin, endMin: bEndMin };
 
-  // 1. Build Required Coverage Curve & Daily Pressure
+  // 1. Build Required Coverage Curve & Daily Pressure per Physical Resource
   const { requiredCurve, resourceRequirements, dailyPressureMap } = buildRequiredCoverageCurve(demands, config);
 
   // 2. Assign Contract Week WORK / OFF days (P0-1 & P0-2)
   assignWeeklyWorkOffPatterns(config, agents, uniqueDates, dailyPressureMap);
 
-  // 3. Assign Coverage-Optimized Shifts per Working Date (P0-3 & P0-4)
+  // 3. Assign Coverage-Optimized Shifts per Working Date & Physical Resource (P0-3 & P0-4)
   const currentScheduledCurve = new Map<string, number>();
 
   for (let dIdx = 0; dIdx < uniqueDates.length; dIdx++) {
@@ -1727,18 +1721,33 @@ export function generateRoster(
       return s && !s.isOff;
     });
 
-    assignCoverageOptimizedShifts(
-      workingAgentsToday,
-      date,
-      requiredCurve,
-      currentScheduledCurve,
-      config,
-      operatingWindow,
-      demands[0]?.intervalMinutes || 30,
-      dIdx,
-      uniqueDates,
-      resourceRequirements
-    );
+    // Group working agents by physical resource (SEGMENT:<segment> or POOL:<poolId>)
+    const resourceAgentGroups = new Map<string, SyntheticAgent[]>();
+    for (const ag of workingAgentsToday) {
+      const resKey = ag.poolId ? `POOL:${ag.poolId}` : `SEGMENT:${ag.segment}`;
+      const list = resourceAgentGroups.get(resKey) || [];
+      list.push(ag);
+      resourceAgentGroups.set(resKey, list);
+    }
+
+    // Optimize each physical resource independently against its own Required-HC curve
+    for (const [resKey, groupAgents] of resourceAgentGroups.entries()) {
+      const resReq = resourceRequirements.get(resKey);
+      const resCurve = resReq ? resReq.requiredCurve : requiredCurve;
+
+      assignCoverageOptimizedShifts(
+        groupAgents,
+        date,
+        resCurve,
+        currentScheduledCurve,
+        config,
+        operatingWindow,
+        demands[0]?.intervalMinutes || 30,
+        dIdx,
+        uniqueDates,
+        resourceRequirements
+      );
+    }
   }
 
   // 4. Out-of-Office Shrinkage Assignment
@@ -1837,6 +1846,19 @@ export function generateRoster(
     let outOfficeSeconds = 0;
     let nonAdherentSeconds = 0;
 
+    // Group interval demands by pool to attribute capacity accurately across simultaneous active segments
+    const sameIntervalDemands = demands.filter(d => d.date === dem.date && d.intervalStart === dem.intervalStart);
+    const poolSegmentsInInterval = new Map<string, DemandRow[]>();
+    const poolTotalWorkload = new Map<string, number>();
+    for (const d of sameIntervalDemands) {
+      const pId = config.segmentConfigs?.[d.segment]?.poolId;
+      if (pId) {
+        if (!poolSegmentsInInterval.has(pId)) poolSegmentsInInterval.set(pId, []);
+        poolSegmentsInInterval.get(pId)!.push(d);
+        poolTotalWorkload.set(pId, (poolTotalWorkload.get(pId) || 0) + (d.workloadSeconds || 0));
+      }
+    }
+
     for (const ag of agents) {
       if (!ag.skills.includes(dem.segment)) continue;
       const daySched = (ag.scheduleByDate as Record<string, AgentDayAssignment>)[dem.date];
@@ -1848,7 +1870,19 @@ export function generateRoster(
       const oShiftSec = Math.max(0, Math.min(intervalEndMin, sEndMin) - Math.max(intervalMin, sStartMin)) * 60;
       if (oShiftSec <= 0) continue;
 
-      const weight = ag.poolId ? (1.0 / ag.skills.length) : 1.0;
+      // Attributed capacity: 1.0 for single-segment/dedicated, proportional workload share if shared concurrently
+      let weight = 1.0;
+      if (ag.poolId && poolSegmentsInInterval.has(ag.poolId)) {
+        const segs = poolSegmentsInInterval.get(ag.poolId)!;
+        if (segs.length > 1) {
+          const totW = poolTotalWorkload.get(ag.poolId) || 0;
+          if (totW > 0) {
+            weight = (dem.workloadSeconds || 0) / totW;
+          } else {
+            weight = 1.0 / segs.length;
+          }
+        }
+      }
       scheduledAgentSeconds += oShiftSec * weight;
 
       if (daySched.isOutOfOffice) {
@@ -1942,8 +1976,8 @@ export function generateRoster(
     config,
     agents,
     uniqueDates,
-    minDemandMin,
-    maxDemandMin
+    bStartMin,
+    bEndMin
   );
 
   const validationResult = validateContractWeek(config, agents, uniqueDates, intervalStaffing);
